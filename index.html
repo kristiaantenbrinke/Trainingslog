@@ -119,6 +119,16 @@ input.txt{flex:1;min-width:0;background:var(--card);border:1px solid var(--line)
 .pinbox input{width:100%;text-align:center;font-size:22px;letter-spacing:.2em;margin-bottom:12px}
 .pinbox .btn{width:100%}
 .sync{font-size:12px;color:var(--mut);text-align:center;margin-top:24px}
+.finish{margin-top:18px}
+.finish .btn{width:100%;padding:15px 16px;font-size:16px}
+.finish .btn.warn{background:var(--warn);border-color:var(--warn);color:#1d1404}
+.donebox{background:rgba(95,211,141,.10);border:1px solid rgba(95,211,141,.35);border-radius:18px;padding:16px;margin-top:14px}
+.donebox .t{font-size:18px;font-weight:800;color:var(--ok)}
+.donebox .s{color:var(--mut);font-size:14px;margin-top:4px;line-height:1.5}
+.card.skip{opacity:.65}
+.skipl{color:var(--mut);font-size:14px;margin-top:6px}
+.badge.skip{background:var(--card2);color:var(--mut)}
+.ok{color:var(--ok)}
 </style>
 </head>
 <body>
@@ -144,7 +154,7 @@ const PEOPLE = ["Kristiaan", "Rutger"];
 const S = {
   me: PEOPLE.includes(load("me")) ? load("me") : PEOPLE[0],
   tab: "train", dayId: load("day"), date: today(),
-  days: [], logs: [], daysReady: false, logsReady: false,
+  days: [], logs: [], sessions: [], daysReady: false, logsReady: false, autoDayDone: false,
   phase: "boot", pin: load("pin") || "", outbox: [], offline: false, syncing: false, lastSync: 0, err: "",
   drafts: {}, editing: {}, saving: {}, openHist: {}, form: {},
   histWho: "me", confirm: ""
@@ -168,6 +178,18 @@ function fmtLong(iso){
 }
 function sorted(list){ return [...list].sort((a,b) => a.date < b.date ? 1 : a.date > b.date ? -1 : (num(b.ts) - num(a.ts))); }
 function hist(ex){ const k = key(ex); return sorted(S.logs.filter(l => l.person === S.me && l.exKey === k)); }
+const WEEKDAYS = ["zondag","maandag","dinsdag","woensdag","donderdag","vrijdag","zaterdag"];
+function autoDay(){
+  const p = S.date.split("-").map(Number); if (p.length !== 3) return;
+  const wd = WEEKDAYS[new Date(p[0], p[1]-1, p[2]).getDay()];
+  const d = S.days.find(x => key(x.name) === wd);
+  if (d) S.dayId = d.id;
+}
+function sameDay(l, day){ return !l.dayName || l.dayName === day.name; }
+function todayLog(all, day){ return all.find(l => l.date === S.date && sameDay(l, day)); }
+function sessionId(day){ return S.date + "_" + key(S.me) + "_" + day.id; }
+function session(day){ return S.sessions.find(s => s.id === sessionId(day)); }
+function volume(l){ return rounds(l).reduce((t, r) => t + r.kg * r.reps, 0); }
 function curDay(){ return S.days.find(d => d.id === S.dayId) || S.days[0]; }
 function allExercises(){
   const m = new Map();
@@ -204,18 +226,22 @@ function logFromServer(l){ return { id: String(l.id), person: l.person, exercise
   kg: num(l.kg), sets: num(l.sets), reps: num(l.reps), note: l.note || "", date: String(l.date || "").slice(0, 10), dayName: l.day_name || "", ts: num(l.ts) }; }
 function logToServer(l){ return { id: l.id, person: l.person, exercise: l.exercise, ex_key: l.exKey, rounds: l.rounds, kg: l.kg, sets: l.sets, reps: l.reps, note: l.note, date: l.date, day_name: l.dayName, ts: l.ts }; }
 function dayFromServer(d){ return { id: String(d.id), name: String(d.name || ""), order: num(d.ord), exercises: Array.isArray(d.exercises) ? d.exercises.filter(x => typeof x === "string") : [] }; }
+function sessionFromServer(s){ return { id: String(s.id), person: s.person, dayId: s.day_id, dayName: s.day_name || "", date: String(s.date || "").slice(0, 10), doneAt: num(s.done_at) }; }
+function sessionToServer(s){ return { id: s.id, person: s.person, day_id: s.dayId, day_name: s.dayName, date: s.date, done_at: s.doneAt }; }
 function dayToServer(d){ return { id: d.id, name: d.name, ord: d.order, exercises: d.exercises }; }
 
 function applyOp(op){
   const a = op.args;
   if (op.fn === "tl_save_log") { const l = logFromServer(a.p); S.logs = S.logs.filter(x => x.id !== l.id).concat([l]); }
   else if (op.fn === "tl_delete_log") S.logs = S.logs.filter(x => x.id !== a.p_id);
+  else if (op.fn === "tl_save_session") { const s = sessionFromServer(a.p); S.sessions = S.sessions.filter(x => x.id !== s.id).concat([s]); }
+  else if (op.fn === "tl_delete_session") S.sessions = S.sessions.filter(x => x.id !== a.p_id);
   else if (op.fn === "tl_save_day") { const d = dayFromServer(a.p); S.days = S.days.filter(x => x.id !== d.id).concat([d]).sort((x, y) => x.order - y.order); }
   else if (op.fn === "tl_delete_day") S.days = S.days.filter(x => x.id !== a.p_id);
 }
 function persist(){
   store("outbox", JSON.stringify(S.outbox));
-  store("cache", JSON.stringify({ days: S.days, logs: S.logs.slice(0, 3000) }));
+  store("cache", JSON.stringify({ days: S.days, logs: S.logs.slice(0, 3000), sessions: S.sessions.slice(0, 1000) }));
 }
 function queue(fn, args){
   const op = { fn, args }; applyOp(op); S.outbox.push(op); persist(); render(); flush();
@@ -244,8 +270,10 @@ async function sync(){
     const data = await rpc("tl_load", { p_pin: S.pin });
     S.days = (data.days || []).map(dayFromServer);
     S.logs = (data.logs || []).map(logFromServer).filter(l => l.exercise && l.date);
+    S.sessions = (data.sessions || []).map(sessionFromServer).filter(s => s.date);
     S.outbox.forEach(applyOp);
     S.daysReady = S.logsReady = true; S.offline = false; S.err = ""; S.lastSync = Date.now(); S.phase = "app";
+    if (!S.autoDayDone) { S.autoDayDone = true; autoDay(); }
     persist();
   } catch(e) {
     if (e.pin) logout(); else if (e.net) S.offline = true; else S.err = e.message;
@@ -296,14 +324,27 @@ function vTrain(){
   if (!S.logsReady) return `<div class="loading">Trainingen laden…</div>`;
   const day = curDay();
   const exs = Array.isArray(day.exercises) ? day.exercises : [];
-  const done = exs.filter(ex => hist(ex).some(l => l.date === S.date)).length;
+  const logged = exs.map(ex => todayLog(hist(ex), day)).filter(Boolean);
+  const done = logged.length;
+  const ses = session(day);
+  let finish;
+  if (ses) {
+    const vol = Math.round(logged.reduce((t, l) => t + volume(l), 0));
+    finish = `<div class="donebox"><div class="t">✓ Training afgerond</div>
+      <div class="s">${done} van ${exs.length} oefeningen gedaan${vol ? ` · ${vol.toLocaleString("nl-NL")} kg verzet` : ""}</div>
+      <div class="row gap" style="margin-top:12px"><button class="btn ghost sm" data-act="reopen" data-id="${esc(day.id)}">Training heropenen</button></div></div>`;
+  } else if (exs.length) {
+    const open = exs.length - done, sure = S.confirm === "finish:" + day.id;
+    finish = `<div class="finish"><button class="btn ${sure ? "warn" : "primary"}" data-act="finish" data-id="${esc(day.id)}">${sure ? `Nog ${open} ${open === 1 ? "oefening" : "oefeningen"} open. Tik nogmaals om af te ronden` : "Training afronden"}</button></div>`;
+  } else finish = "";
   return `<div class="chips">${S.days.map(d => `<button class="chip ${d.id===day.id?"on":""}" data-act="day" data-id="${esc(d.id)}">${esc(d.name)}</button>`).join("")}</div>
   <div class="row between gap">
-    <div><div class="h1">${esc(day.name)}</div><div class="sub">${S.me} · ${done} van ${exs.length} gelogd</div></div>
+    <div><div class="h1">${esc(day.name)}</div><div class="sub">${S.me} · ${done} van ${exs.length} gelogd${ses ? ` · <span class="ok">afgerond</span>` : ""}</div></div>
     <label class="date">Datum<input type="date" id="dt" value="${S.date}"></label>
   </div>
-  ${exs.length ? exs.map((ex,i) => card(ex,i)).join("") : `<div class="empty sm"><p>Nog geen oefeningen voor ${esc(day.name)}. Voeg hieronder de eerste toe.</p></div>`}
-  ${addBox(day, "t")}`;
+  ${exs.length ? exs.map((ex,i) => card(ex,i,day,ses)).join("") : `<div class="empty sm"><p>Nog geen oefeningen voor ${esc(day.name)}. Voeg hieronder de eerste toe.</p></div>`}
+  ${finish}
+  ${ses ? "" : addBox(day, "t")}`;
 }
 
 function rounds(l){
@@ -326,14 +367,18 @@ function trend(cur, prev){
   return "";
 }
 
-function card(ex, i){
-  const k = key(ex), dk = S.me + "|" + k + "|" + S.date;
+function card(ex, i, day, ses){
+  const k = key(ex), dk = S.me + "|" + k + "|" + S.date + "|" + day.id;
   const all = hist(ex);
-  const tl = all.find(l => l.date === S.date);
-  const prev = all.find(l => l.date < S.date);
+  const tl = todayLog(all, day);
+  const prev = all.find(l => l !== tl && (l.date < S.date || (l.date === S.date && !sameDay(l, day))));
+  if (ses && !tl && !S.editing[dk]) {
+    return `<section class="card skip"><div class="ctop"><div class="cname">${esc(ex)}</div><span class="badge skip">Overgeslagen</span></div>
+      <div class="row gap"><button class="btn ghost sm" data-act="edit" data-k="${esc(dk)}">Alsnog loggen</button></div></section>`;
+  }
   if (!S.drafts[dk]) {
     const src = tl || prev;
-    S.drafts[dk] = { ex, k, person: S.me, date: S.date,
+    S.drafts[dk] = { ex, k, person: S.me, date: S.date, dayId: day.id, dayName: day.name, existingId: tl ? tl.id : "",
       rounds: src ? rounds(src).map(r => ({ kg: fmtKg(r.kg), reps: String(r.reps) })) : [1,2,3].map(() => ({ kg: "", reps: "8" })),
       note: tl ? String(tl.note||"") : "" };
   }
@@ -358,7 +403,7 @@ function card(ex, i){
       <div class="row gap rbtns"><button class="btn ghost sm" data-act="addRound" data-k="${esc(dk)}">+ Ronde</button>${d.rounds.length > 1 ? `<button class="btn ghost sm" data-act="delRound" data-k="${esc(dk)}">− Ronde</button>` : ""}<button class="btn ghost sm" data-act="fillKg" data-k="${esc(dk)}" title="Gewicht van ronde 1 naar alle rondes">Kilo's gelijk</button></div>`;
     body = `${prevLine}${grid}
       <textarea id="n-${i}" data-f="note" data-k="${esc(dk)}" rows="1" placeholder="Notitie, bijv. laatste ronde zwaar of volgende keer omhoog">${esc(d.note)}</textarea>
-      <div class="row gap"><button class="btn primary grow" data-act="save" data-k="${esc(dk)}" ${S.saving[dk]?"disabled":""}>${tl ? "Bijwerken" : "Opslaan"}</button>${tl ? `<button class="btn ghost" data-act="cancel" data-k="${esc(dk)}">Annuleer</button>` : ""}${histBtn}</div>`;
+      <div class="row gap"><button class="btn primary grow" data-act="save" data-k="${esc(dk)}" ${S.saving[dk]?"disabled":""}>${tl ? "Bijwerken" : "Opslaan"}</button>${tl ? `<button class="btn ghost" data-act="cancel" data-k="${esc(dk)}">Annuleer</button>` : ses ? `<button class="btn ghost" data-act="cancel" data-k="${esc(dk)}">Annuleer</button>` : ""}${histBtn}</div>`;
   }
   const mini = S.openHist[k]
     ? `<div class="mini">${all.length ? all.slice(0,8).map(l => `<div><span>${fmtDate(l.date)}</span><span class="rps" style="justify-content:flex-end">${fmtRounds(l)}</span></div>`).join("") : `<div><span>Nog geen eerdere trainingen</span></div>`}</div>`
@@ -394,7 +439,8 @@ function vHist(){
   list.forEach(l => { const g = groups[groups.length-1]; if (g && g.date === l.date) g.items.push(l); else groups.push({date: l.date, items: [l]}); });
   out += groups.slice(0, 60).map(g => {
     const names = [...new Set(g.items.map(l => l.dayName).filter(Boolean))].join(", ");
-    return `<div class="hday">${fmtLong(g.date)}${names ? ` <span>· ${esc(names)}</span>` : ""}</div>` + g.items.map(l => `
+    const fin = S.sessions.some(s => s.date === g.date && (S.histWho === "all" || s.person === S.me));
+    return `<div class="hday">${fmtLong(g.date)}${names ? ` <span>· ${esc(names)}</span>` : ""}${fin ? ` <span class="ok">· ✓ afgerond</span>` : ""}</div>` + g.items.map(l => `
       <div class="hrow"><div class="grow"><div class="hx">${esc(l.exercise)}${S.histWho === "all" ? `<span class="who">${esc(l.person)}</span>` : ""}</div>${l.note ? `<div class="pnote">${esc(l.note)}</div>` : ""}</div>
       <div class="hv">${fmtRounds(l)}</div>
       <button class="x ${S.confirm === "log:" + l.id ? "sure" : ""}" data-act="delLog" data-id="${esc(l.id)}" aria-label="Verwijderen">${S.confirm === "log:" + l.id ? "Wis" : "×"}</button></div>`).join("");
@@ -429,11 +475,10 @@ async function act(a, ds){
     case "save": {
       const d = S.drafts[ds.k]; if (!d || S.saving[ds.k]) return;
       if (d.rounds.some(r => !String(r.kg).trim()) && !confirmZero(ds.k)) { flash("Niet alle kilo's zijn ingevuld. Tik nogmaals om toch op te slaan"); render(); return; }
-      const id = d.date + "_" + key(d.person) + "_" + d.k;
-      const day = curDay();
+      const id = d.existingId || (d.date + "_" + key(d.person) + "_" + d.dayId + "_" + d.k);
       const body = { id, person: d.person, exercise: d.ex, exKey: d.k, rounds: d.rounds.map(r => ({ kg: num(r.kg), reps: Math.round(num(r.reps)) })),
         kg: Math.max(...d.rounds.map(r => num(r.kg))), sets: d.rounds.length, reps: Math.round(num(d.rounds[0].reps)),
-        note: String(d.note||"").trim().slice(0, 500), date: d.date, dayName: day ? String(day.name||"") : "", ts: Date.now() };
+        note: String(d.note||"").trim().slice(0, 500), date: d.date, dayName: String(d.dayName || ""), ts: Date.now() };
       delete S.editing[ds.k]; delete S.drafts[ds.k];
       queue("tl_save_log", { p: logToServer(body) });
       flash("Opgeslagen 💪");
@@ -488,6 +533,22 @@ async function act(a, ds){
       catch(e) { flash(e.pin ? "Onjuiste pincode" : e.net ? "Geen verbinding" : "Dat lukte niet, probeer het opnieuw"); return; }
       S.pin = pin; store("pin", pin); S.form.pin2 = ""; await sync(); return;
     }
+    case "finish": {
+      const day = S.days.find(x => x.id === ds.id); if (!day) return;
+      const open = (day.exercises || []).filter(ex => !todayLog(hist(ex), day)).length;
+      if (open && S.confirm !== "finish:" + day.id) { askConfirm("finish:" + day.id); break; }
+      S.confirm = "";
+      Object.keys(S.editing).forEach(k => delete S.editing[k]);
+      queue("tl_save_session", { p: sessionToServer({ id: sessionId(day), person: S.me, dayId: day.id, dayName: day.name, date: S.date, doneAt: Date.now() }) });
+      window.scrollTo(0, 0);
+      flash("Training afgerond 💪");
+      break;
+    }
+    case "reopen": {
+      const day = S.days.find(x => x.id === ds.id); if (!day) return;
+      queue("tl_delete_session", { p_id: sessionId(day) });
+      break;
+    }
     case "delLog": {
       if (S.confirm !== "log:" + ds.id) { askConfirm("log:" + ds.id); break; }
       S.confirm = "";
@@ -513,7 +574,7 @@ document.addEventListener("input", e => {
 });
 document.addEventListener("change", async e => {
   const t = e.target;
-  if (t.id === "dt" && t.value) { S.date = t.value; render(); }
+  if (t.id === "dt" && t.value) { S.date = t.value; autoDay(); render(); }
   else if (t.dataset.rename) {
     const day = S.days.find(x => x.id === t.dataset.rename), name = t.value.trim().slice(0, 40);
     if (day && name && name !== day.name) queue("tl_save_day", { p: dayToServer({ ...day, name }) });
@@ -532,7 +593,7 @@ document.addEventListener("keydown", e => {
 /* ---------- start ---------- */
 (async () => {
   try { S.outbox = JSON.parse(load("outbox") || "[]"); } catch(e) { S.outbox = []; }
-  try { const c = JSON.parse(load("cache") || "null"); if (c && S.pin) { S.days = c.days || []; S.logs = c.logs || []; S.daysReady = S.logsReady = true; S.phase = "app"; } } catch(e) {}
+  try { const c = JSON.parse(load("cache") || "null"); if (c && S.pin) { S.days = c.days || []; S.logs = c.logs || []; S.sessions = c.sessions || []; S.daysReady = S.logsReady = true; S.phase = "app"; } } catch(e) {}
   render();
   if (!configured) return;
   if (S.pin) { await sync(); }
